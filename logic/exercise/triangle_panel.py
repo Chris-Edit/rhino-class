@@ -1,9 +1,12 @@
 import math
 import itertools
 import Rhino.Geometry as geo
+from Rhino import RhinoMath
 
 
 class TriPanel:
+    TOL = 0.001
+
     def __init__(
         self,
         pt_base: geo.Point3d,
@@ -14,9 +17,19 @@ class TriPanel:
         self.pt_base = pt_base
         self.pt_foot = pt_foot
         self.pt_vertical = pt_vertical
-        self.foot_length = pt_vertical.DistanceTo(pt_foot)
-
         self.perp_vec = perp_vec
+        self.panel_plane = geo.Plane(pt_vertical, perp_vec)  # type: ignore
+        self.transform = geo.Transform.PlaneToPlane(geo.Plane.WorldXY, self.panel_plane)  # type: ignore
+
+        self.base_length = pt_base.DistanceTo(pt_vertical)
+        self.foot_length = pt_foot.DistanceTo(pt_vertical)
+
+        self.foot_plane = geo.Plane(pt_vertical, pt_foot - pt_vertical, perp_vec)  # type: ignore
+        line = geo.Line(pt_vertical, pt_base)  # type: ignore
+        self.pt_foot_to_foot = line.ClosestPoint(pt_foot, False)
+
+        self.foot_to_foot_length = pt_vertical.DistanceTo(self.pt_foot_to_foot)
+        self.perp_length = pt_foot.DistanceTo(self.pt_foot_to_foot)
 
     @property
     def crv(self) -> geo.Curve:
@@ -24,27 +37,37 @@ class TriPanel:
             [self.pt_base, self.pt_foot, self.pt_vertical, self.pt_base]
         )
 
-    def move(self, ratio: float):
-        # type: (...) -> TriPanel
-        if ratio <= 0:
-            return self
+    def get_moved_crv(self, ratio: float):
+        # type: (...) -> geo.Curve
+        if ratio < TriPanel.TOL:
+            return self.crv
 
         height = self.foot_length * ratio
         pt_vertical = self.pt_vertical + self.perp_vec * height  # type: ignore
 
-        moved_pts = []  # type: list[geo.Point3d]
-        for pt in [self.pt_base, self.pt_foot]:
-            vec = pt - self.pt_vertical  # type: ignore
-            vec.Unitize()
+        vec = self.pt_base - self.pt_vertical  # type: ignore
+        vec.Unitize()
+        move_length = math.sqrt(self.base_length**2 - height**2)
+        pt_base = self.pt_vertical + vec * move_length
 
-            seg_length = pt.DistanceTo(self.pt_vertical)
-            if seg_length > height:
-                move_length = math.sqrt(seg_length**2 - height**2)
-            else:
-                move_length = 0.0
-            moved_pts.append(self.pt_vertical + vec * move_length)
+        if ratio > 1 - TriPanel.TOL:
+            return geo.PolylineCurve([pt_base, self.pt_vertical, pt_vertical, pt_base])
 
-        return TriPanel(moved_pts[0], moved_pts[1], pt_vertical, self.perp_vec)
+        vec_base = pt_base - pt_vertical
+        vec_base.Unitize()
+        pt_foot_to_foot = pt_vertical + vec_base * self.foot_to_foot_length
+        circle_plane = geo.Plane(pt_foot_to_foot, vec_base)  # type: ignore
+        circle = geo.Circle(circle_plane, self.perp_length)  # type: ignore
+
+        _, *params = geo.Intersect.Intersection.PlaneCircle(self.foot_plane, circle)  # type: ignore
+        itx_pts = [circle.PointAt(param) for param in params if param != RhinoMath.UnsetValue]  # type: ignore
+
+        if itx_pts:
+            pt_foot = min(itx_pts, key=lambda pt: (self.transform * pt).Z)
+        else:
+            pt_foot = self.pt_vertical
+
+        return geo.PolylineCurve([pt_base, pt_foot, pt_vertical, pt_base])
 
 
 class TriModule:
@@ -102,7 +125,7 @@ class TriModule:
 
     def crvs_at_ratio(self, ratio: float):
         # type: (...) -> list[geo.Curve]
-        return [panel.move(ratio).crv for panel in self.base_panels]
+        return [panel.get_moved_crv(ratio) for panel in self.base_panels]
 
 
 class TriFacade:
@@ -112,9 +135,8 @@ class TriFacade:
     def get_breps(self, sunlight_vec: geo.Vector3d):
         # type: (...) -> list[geo.Brep]
         crvs = []  # type: list[geo.Curve]
-        standard_vec = -sunlight_vec  # type: ignore
         for tri_module in self.tri_modules:
-            cos_val = tri_module.perp_vec * standard_vec
+            cos_val = tri_module.perp_vec * -sunlight_vec  # type: ignore
             remap_val = (cos_val + 1) / 2
             crvs += tri_module.crvs_at_ratio(remap_val)
         return geo.Brep.CreatePlanarBreps(crvs, 0.001)
